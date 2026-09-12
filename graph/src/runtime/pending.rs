@@ -1334,9 +1334,9 @@ impl Pending {
                         continue;
                     }
 
-                    // Build a set of all existing keys for this label in one pass
+                    // Keep every candidate: distinct integers can share a key.
                     if let Some(lm) = g.get_label_matrix(label) {
-                        let mut seen: FxHashMap<Vec<u8>, u64> = FxHashMap::default();
+                        let mut seen: FxHashMap<Vec<u8>, Vec<u64>> = FxHashMap::default();
                         for (other_id, _) in lm.iter(0, u64::MAX) {
                             let other_key =
                                 Graph::build_composite_key(&constraint.properties, |prop| {
@@ -1346,14 +1346,20 @@ impl Pending {
                                 // likewise, this node does not participate
                                 continue;
                             }
-                            if let Some(&existing_id) = seen.get(&other_key)
-                                && existing_id != other_id
-                            {
+                            let candidates = seen.entry(other_key).or_default();
+                            if candidates.iter().any(|&existing_id| {
+                                existing_id != other_id
+                                    && Graph::constraint_properties_equal(
+                                        &constraint.properties,
+                                        |prop| g.get_node_attribute(existing_id.into(), prop),
+                                        |prop| g.get_node_attribute(other_id.into(), prop),
+                                    )
+                            }) {
                                 return Err(format!(
                                     "unique constraint violation on node of type {label}"
                                 ));
                             }
-                            seen.insert(other_key, other_id);
+                            candidates.push(other_id);
                         }
                     }
                 }
@@ -1407,9 +1413,9 @@ impl Pending {
                         continue;
                     }
 
-                    // Build a set of all existing keys for this type in one pass
+                    // Keep every candidate: distinct integers can share a key.
                     if let Some(tensor) = g.get_relationship_matrix(type_name) {
-                        let mut seen: FxHashMap<Vec<u8>, u64> = FxHashMap::default();
+                        let mut seen: FxHashMap<Vec<u8>, Vec<u64>> = FxHashMap::default();
                         for (_, _, other_eid) in tensor.iter(0, u64::MAX, false) {
                             let other_key =
                                 Graph::build_composite_key(&constraint.properties, |prop| {
@@ -1419,14 +1425,22 @@ impl Pending {
                                 // likewise, this edge does not participate
                                 continue;
                             }
-                            if let Some(&existing_id) = seen.get(&other_key)
-                                && existing_id != other_eid
-                            {
+                            let candidates = seen.entry(other_key).or_default();
+                            if candidates.iter().any(|&existing_id| {
+                                existing_id != other_eid
+                                    && Graph::constraint_properties_equal(
+                                        &constraint.properties,
+                                        |prop| {
+                                            g.get_relationship_attribute(existing_id.into(), prop)
+                                        },
+                                        |prop| g.get_relationship_attribute(other_eid.into(), prop),
+                                    )
+                            }) {
                                 return Err(format!(
                                     "unique constraint violation, on edge of relationship-type {type_name}"
                                 ));
                             }
-                            seen.insert(other_key, other_eid);
+                            candidates.push(other_eid);
                         }
                     }
                 }

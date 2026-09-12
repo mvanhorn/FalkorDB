@@ -62,6 +62,7 @@
 //! raw query string. Plans are invalidated when the UDF version changes.
 
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::HashMap,
     hash::Hash,
     num::NonZeroUsize,
@@ -101,7 +102,11 @@ use crate::{
     },
     parser::cypher::Parser,
     planner::{IR, Planner, binder::Binder, optimizer::optimize},
-    runtime::{orderset::OrderSet, value::Value, vec_distance},
+    runtime::{
+        orderset::OrderSet,
+        value::{CompareValue, DisjointOrNull, Value},
+        vec_distance,
+    },
     threadpool::spawn,
 };
 
@@ -4258,7 +4263,7 @@ impl Graph {
                 let Some(lm) = self.get_label_matrix(&constraint.label) else {
                     return true;
                 };
-                let mut seen: FxHashSet<Vec<u8>> = FxHashSet::default();
+                let mut seen: FxHashMap<Vec<u8>, Vec<NodeId>> = FxHashMap::default();
                 for (node_id, _) in lm.iter(0, u64::MAX) {
                     let key = Self::build_composite_key(&constraint.properties, |prop| {
                         self.get_node_attribute(NodeId(node_id), prop)
@@ -4268,9 +4273,17 @@ impl Graph {
                         // does not participate in the constraint
                         continue;
                     }
-                    if !seen.insert(key) {
+                    let candidates = seen.entry(key).or_default();
+                    if candidates.iter().any(|&other_id| {
+                        Self::constraint_properties_equal(
+                            &constraint.properties,
+                            |prop| self.get_node_attribute(NodeId(node_id), prop),
+                            |prop| self.get_node_attribute(other_id, prop),
+                        )
+                    }) {
                         return false;
                     }
+                    candidates.push(NodeId(node_id));
                 }
                 true
             }
@@ -4278,7 +4291,7 @@ impl Graph {
                 let Some(tensor) = self.get_relationship_matrix(&constraint.label) else {
                     return true;
                 };
-                let mut seen: FxHashSet<Vec<u8>> = FxHashSet::default();
+                let mut seen: FxHashMap<Vec<u8>, Vec<RelationshipId>> = FxHashMap::default();
                 for (_, _, edge_id) in tensor.iter(0, u64::MAX, false) {
                     let key = Self::build_composite_key(&constraint.properties, |prop| {
                         self.get_relationship_attribute(RelationshipId(edge_id), prop)
@@ -4288,22 +4301,37 @@ impl Graph {
                         // does not participate in the constraint
                         continue;
                     }
-                    if !seen.insert(key) {
+                    let candidates = seen.entry(key).or_default();
+                    if candidates.iter().any(|&other_id| {
+                        Self::constraint_properties_equal(
+                            &constraint.properties,
+                            |prop| self.get_relationship_attribute(RelationshipId(edge_id), prop),
+                            |prop| self.get_relationship_attribute(other_id, prop),
+                        )
+                    }) {
                         return false;
                     }
+                    candidates.push(RelationshipId(edge_id));
                 }
                 true
             }
         }
     }
 
-    /// Build the composite unique-constraint key for `properties`.
+    /// Build a composite unique-constraint candidate key for `properties`.
+    ///
+    /// Matching nonempty keys require verification with
+    /// [`Self::constraint_properties_equal`]. Numeric equality is not transitive:
+    /// distinct integers can round to the same f64 and compare equal to that
+    /// float. Keys group these candidates without claiming they are duplicates.
+    /// Tags, little-endian fields and byte lengths/counts frame each component;
+    /// this encoding is transient and is not a persistence format.
     ///
     /// Returns an empty key as soon as *any* constrained property is NULL or
     /// absent: such a key is unknown, and an unknown key cannot be proven to
     /// collide with another, so the entity satisfies the constraint vacuously.
     /// Callers treat an empty key as "this entity does not participate in the
-    /// constraint" and skip it.
+    /// constraint" and skip it. Unsupported property values also yield no key.
     #[must_use]
     pub fn build_composite_key(
         properties: &[Arc<String>],
@@ -4311,15 +4339,98 @@ impl Graph {
     ) -> Vec<u8> {
         let mut key = Vec::new();
         for prop in properties {
-            match get(prop) {
-                Some(v) if !matches!(v, Value::Null) => {
-                    key.extend_from_slice(format!("{v:?}").as_bytes());
-                }
-                _ => return Vec::new(),
+            let Some(value) = get(prop) else {
+                return Vec::new();
+            };
+            if !Self::encode_constraint_value(&value, &mut key) {
+                return Vec::new();
             }
-            key.push(b'|');
         }
         key
+    }
+
+    fn encode_constraint_value(
+        value: &Value,
+        key: &mut Vec<u8>,
+    ) -> bool {
+        fn number_bytes(value: f64) -> [u8; 8] {
+            // Numeric and point comparison consider both signs of zero equal.
+            if value == 0.0 { 0.0 } else { value }.to_le_bytes()
+        }
+
+        match value {
+            Value::Bool(value) => key.extend_from_slice(&[1, u8::from(*value)]),
+            Value::Int(value) => {
+                key.push(2);
+                key.extend_from_slice(&number_bytes(*value as f64));
+            }
+            Value::Float(value) => {
+                key.push(2);
+                key.extend_from_slice(&number_bytes(*value));
+            }
+            Value::String(value) => {
+                key.push(3);
+                key.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                key.extend_from_slice(value.as_bytes());
+            }
+            Value::List(values) => {
+                key.push(4);
+                key.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for value in values.iter() {
+                    if !Self::encode_constraint_value(value, key) {
+                        return false;
+                    }
+                }
+            }
+            Value::Point(point) => {
+                key.push(5);
+                key.extend_from_slice(&number_bytes(f64::from(point.latitude)));
+                key.extend_from_slice(&number_bytes(f64::from(point.longitude)));
+            }
+            Value::VecF32(values) => {
+                key.push(6);
+                key.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for value in values.iter() {
+                    key.extend_from_slice(&number_bytes(f64::from(*value)));
+                }
+            }
+            Value::Datetime(value) => {
+                key.push(7);
+                key.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Date(value) => {
+                key.push(8);
+                key.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Time(value) => {
+                key.push(9);
+                key.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::Duration(value) => {
+                key.push(10);
+                key.extend_from_slice(&value.to_le_bytes());
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Only definite Cypher equality of every component proves a duplicate.
+    /// In particular, NULL, NaN and disjoint comparisons (including within
+    /// lists) must not be mistaken for equality based on their ordering alone.
+    pub(crate) fn constraint_properties_equal(
+        properties: &[Arc<String>],
+        mut left: impl FnMut(&Arc<String>) -> Option<Value>,
+        mut right: impl FnMut(&Arc<String>) -> Option<Value>,
+    ) -> bool {
+        properties
+            .iter()
+            .all(|prop| match (left(prop), right(prop)) {
+                (Some(a), Some(b)) => {
+                    a.compare_value(&b) == (CmpOrdering::Equal, DisjointOrNull::None)
+                }
+                _ => false,
+            })
     }
 
     /// Drop a constraint by type, entity type, label and properties.
@@ -4923,6 +5034,165 @@ mod reclaim_ids_tests {
 #[cfg(test)]
 mod composite_key_tests {
     use super::*;
+    use crate::runtime::value::Point;
+
+    fn tuple_key(values: &[Value]) -> Vec<u8> {
+        let props: Vec<_> = (0..values.len()).map(|i| Arc::new(i.to_string())).collect();
+        Graph::build_composite_key(&props, |p| {
+            Some(values[p.parse::<usize>().unwrap()].clone())
+        })
+    }
+
+    fn equal(
+        left: &[Value],
+        right: &[Value],
+    ) -> bool {
+        assert_eq!(left.len(), right.len());
+        let props: Vec<_> = (0..left.len()).map(|i| Arc::new(i.to_string())).collect();
+        Graph::constraint_properties_equal(
+            &props,
+            |p| Some(left[p.parse::<usize>().unwrap()].clone()),
+            |p| Some(right[p.parse::<usize>().unwrap()].clone()),
+        )
+    }
+
+    fn pair(
+        left: Value,
+        right: Value,
+        same_key: bool,
+        duplicate: bool,
+    ) {
+        let left = [left];
+        let right = [right];
+        assert!(!tuple_key(&left).is_empty());
+        assert!(!tuple_key(&right).is_empty());
+        assert_eq!(tuple_key(&left) == tuple_key(&right), same_key);
+        assert_eq!(equal(&left, &right), duplicate);
+        assert_eq!(equal(&right, &left), duplicate);
+    }
+
+    fn string(value: &str) -> Value {
+        Value::String(Arc::new(value.to_string()))
+    }
+
+    fn list(values: Vec<Value>) -> Value {
+        Value::List(Arc::new(values.into_iter().collect()))
+    }
+
+    #[test]
+    fn numeric_candidates_require_value_equality() {
+        for value in [1, -1, 0, i64::MIN, i64::MAX] {
+            pair(Value::Int(value), Value::Float(value as f64), true, true);
+        }
+        pair(Value::Int(0), Value::Float(-0.0), true, true);
+        pair(Value::Float(0.0), Value::Float(-0.0), true, true);
+        pair(Value::Bool(false), Value::Int(0), false, false);
+        for value in [0.25, -0.25, f64::INFINITY, f64::NEG_INFINITY] {
+            pair(Value::Float(value), Value::Float(value), true, true);
+        }
+        pair(Value::Float(0.25), Value::Float(0.5), false, false);
+        pair(
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            false,
+            false,
+        );
+        pair(Value::Int(1), Value::Float(1.5), false, false);
+        pair(Value::Float(f64::NAN), Value::Float(f64::NAN), true, false);
+        for (a, b) in [
+            (9007199254740992, 9007199254740993),
+            (i64::MIN, i64::MIN + 1),
+            (i64::MAX - 1, i64::MAX),
+        ] {
+            pair(Value::Int(a), Value::Int(b), true, false);
+            pair(Value::Int(a), Value::Float(b as f64), true, true);
+            pair(Value::Int(b), Value::Float(a as f64), true, true);
+        }
+        // Out-of-range floats must not saturate to an integer key.
+        pair(Value::Int(i64::MAX), Value::Float(f64::MAX), false, false);
+        pair(Value::Int(i64::MIN), Value::Float(-f64::MAX), false, false);
+    }
+
+    #[test]
+    fn types_and_component_boundaries_are_framed() {
+        let values = [
+            string(""),
+            string("1"),
+            string("a|b"),
+            string("a\0b"),
+            Value::Int(1),
+            Value::Bool(true),
+            Value::Datetime(1),
+            Value::Date(1),
+            Value::Time(1),
+            Value::Duration(1),
+        ];
+        for (i, left) in values.iter().enumerate() {
+            for (j, right) in values.iter().enumerate() {
+                pair(left.clone(), right.clone(), i == j, i == j);
+            }
+        }
+        for (left, right) in [
+            ([string("a|"), string("b")], [string("a"), string("|b")]),
+            ([string("a\0"), string("b")], [string("a"), string("\0b")]),
+            ([string(""), string("ab")], [string("a"), string("b")]),
+        ] {
+            assert_ne!(tuple_key(&left), tuple_key(&right));
+            assert!(!equal(&left, &right));
+        }
+    }
+
+    #[test]
+    fn lists_points_and_inconclusive_comparisons() {
+        pair(
+            list(vec![Value::Int(1), list(vec![Value::Float(-0.0)])]),
+            list(vec![Value::Float(1.0), list(vec![Value::Int(0)])]),
+            true,
+            true,
+        );
+        pair(list(vec![]), list(vec![]), true, true);
+        pair(
+            list(vec![string("a|b")]),
+            list(vec![string("a"), string("b")]),
+            false,
+            false,
+        );
+        pair(
+            Value::Point(Point {
+                latitude: -0.0,
+                longitude: 0.0,
+            }),
+            Value::Point(Point {
+                latitude: 0.0,
+                longitude: -0.0,
+            }),
+            true,
+            true,
+        );
+        let vector = Value::VecF32(Arc::new([1.0_f32, 2.0].into_iter().collect()));
+        // VecF32 has no definite equality in compare_value, even with itself.
+        pair(vector.clone(), vector.clone(), true, false);
+        pair(list(vec![vector.clone()]), list(vec![vector]), true, false);
+        pair(
+            list(vec![Value::Float(f64::NAN)]),
+            list(vec![Value::Float(f64::NAN)]),
+            true,
+            false,
+        );
+        for value in [Value::Null, list(vec![Value::Null])] {
+            assert!(tuple_key(&[value.clone()]).is_empty());
+            assert!(!equal(&[value.clone()], &[value]));
+        }
+        for value in [Value::Node(NodeId(0)), list(vec![Value::Node(NodeId(0))])] {
+            assert!(tuple_key(&[value]).is_empty());
+        }
+        let props = [Arc::new("missing".to_string())];
+        assert!(!Graph::constraint_properties_equal(
+            &props,
+            |_| None,
+            |_| None
+        ));
+    }
 
     fn key(
         props: &[&str],

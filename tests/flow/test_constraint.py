@@ -5,6 +5,123 @@ from constraint_utils import *
 
 GRAPH_ID = "constraints"
 
+class testConstraintNumericEquality():
+    def __init__(self):
+        self.env, self.db = Env()
+        self.graph_id = 0
+
+    def graph(self):
+        self.graph_id += 1
+        g = self.db.select_graph(f"constraint_numeric_{self.graph_id}")
+        self.env.getConnection().delete(g.name)
+        return g
+
+    def install(self, g, edge, props=('v',), status='OPERATIONAL'):
+        create = create_unique_edge_constraint if edge else create_unique_node_constraint
+        create(g, 'Numeric', *props, sync=True)
+        constraints = list_constraints(g)
+        self.env.assertEqual(len(constraints), 1)
+        self.env.assertEqual(constraints[0].status, status)
+
+    def create_query(self, edge, *properties):
+        if edge:
+            patterns = [f"()-[:Numeric {{{p}}}]->()" for p in properties]
+        else:
+            patterns = [f"(:Numeric {{{p}}})" for p in properties]
+        return "CREATE " + ", ".join(patterns)
+
+    def snapshot(self, g):
+        nodes = g.query("MATCH (n) RETURN ID(n), labels(n), properties(n) ORDER BY ID(n)").result_set
+        edges = g.query("MATCH ()-[r]->() RETURN ID(r), type(r), properties(r) ORDER BY ID(r)").result_set
+        # repr also distinguishes Python's 1 from 1.0 when checking rollback.
+        return repr((nodes, edges))
+
+    def reject(self, g, query):
+        before = self.snapshot(g)
+        try:
+            g.query(query)
+            self.env.assertTrue(False, message="expected a unique constraint violation")
+        except ResponseError as e:
+            self.env.assertContains("unique constraint violation", str(e))
+        self.env.assertEqual(self.snapshot(g), before)
+
+    def test01_mixed_numeric_creates(self):
+        for edge in (False, True):
+            for first, second in [('1', '1.0'), ('1.0', '1')]:
+                g = self.graph()
+                self.install(g, edge)
+                g.query(self.create_query(edge, f"v: {first}"))
+                self.reject(g, self.create_query(edge, f"v: {second}"))
+
+                g = self.graph()
+                self.install(g, edge)
+                self.reject(g, self.create_query(edge, f"v: {first}", f"v: {second}"))
+
+    def test02_updates_and_label_addition(self):
+        for edge in (False, True):
+            for first, second in [('1', '1.0'), ('1.0', '1')]:
+                g = self.graph()
+                self.install(g, edge)
+                g.query(self.create_query(edge, f"v: {first}", "v: 2"))
+                match = "MATCH ()-[n:Numeric]->()" if edge else "MATCH (n:Numeric)"
+                self.reject(g, f"{match} WHERE n.v = 2 SET n.v = {second}")
+                if not edge:
+                    g.query(f"CREATE (:Unconstrained {{v: {second}}})")
+                    self.reject(g, "MATCH (n:Unconstrained) SET n:Numeric")
+
+    def test03_composite_numeric_components(self):
+        for edge in (False, True):
+            g = self.graph()
+            self.install(g, edge, ('v', 'companion'))
+            g.query(self.create_query(edge, "v: 1, companion: 'a'", "v: 1.0, companion: 'b'"))
+            self.reject(g, self.create_query(edge, "v: 1.0, companion: 'a'"))
+            self.reject(g, self.create_query(edge, "v: 1, companion: 'b'"))
+            # Every missing or NULL component still exempts the whole tuple.
+            g.query(self.create_query(edge, "v: 1", "v: 1.0, companion: null",
+                                      "companion: 'a'", "v: null, companion: 'a'"))
+
+    def test04_initial_validation_and_recreation(self):
+        datasets = [
+            (['1', '1.0'], 'FAILED'),
+            (['1.0', '1'], 'FAILED'),
+            (['9007199254740992', '9007199254740993'], 'OPERATIONAL'),
+            (['9007199254740993', '9007199254740992'], 'OPERATIONAL'),
+            (["'1'", '1'], 'OPERATIONAL'),
+            (['9007199254740992', '9007199254740993', '9007199254740992.0'], 'FAILED'),
+            (['9007199254740992.0', '9007199254740993', '9007199254740992'], 'FAILED'),
+        ]
+        for edge in (False, True):
+            for values, status in datasets:
+                g = self.graph()
+                g.query(self.create_query(edge, *(f"v: {v}" for v in values)))
+                before = self.snapshot(g)
+                self.install(g, edge, status=status)
+                drop = drop_unique_edge_constraint if edge else drop_unique_node_constraint
+                drop(g, 'Numeric', 'v')
+                self.install(g, edge, status=status)
+                self.env.assertEqual(self.snapshot(g), before)
+
+    def test05_large_integer_candidate_buckets(self):
+        for edge in (False, True):
+            for a, b in [(9007199254740992, 9007199254740993),
+                         (-9223372036854775808, -9223372036854775807),
+                         (9223372036854775806, 9223372036854775807)]:
+                for first, second in [(a, b), (b, a)]:
+                    g = self.graph()
+                    self.install(g, edge)
+                    g.query(self.create_query(edge, f"v: {first}"))
+                    g.query(self.create_query(edge, f"v: {second}"))
+                    # An earlier candidate must survive insertion of a distinct
+                    # integer with the same rounded key.
+                    self.reject(g, self.create_query(edge, f"v: {first}"))
+                    self.reject(g, self.create_query(edge, f"v: {float(first):.1f}"))
+
+                    g = self.graph()
+                    self.install(g, edge)
+                    g.query(self.create_query(edge, f"v: {float(first):.1f}"))
+                    self.reject(g, self.create_query(edge, f"v: {first}"))
+                    self.reject(g, self.create_query(edge, f"v: {second}"))
+
 class testConstraintNodes():
     def __init__(self):
         self.env, self.db = Env()
